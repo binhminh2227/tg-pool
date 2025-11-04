@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Pool Poller (Auto discover sessions, reassign & alerts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+WorkingDirectory=/opt/tg-pool
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/tg-pool/.venv/bin/python /opt/tg-pool/app.py
+Restart=always
+RestartSec=3
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target
