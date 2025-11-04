@@ -42,6 +42,7 @@ class Cfg(BaseSettings):
     # alert to telegram bot (optional)
     TELEGRAM_ALERT_BOT_TOKEN: Optional[str] = None
     TELEGRAM_ALERT_CHAT_ID: Optional[str] = None
+    TELEGRAM_ALERT_TOPIC_ID: Optional[int] = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
