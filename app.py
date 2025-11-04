@@ -1,552 +1,517 @@
-import os, glob, asyncio, random, traceback
-from typing import Dict, Optional, List, Tuple
-from datetime import datetime
-from contextlib import asynccontextmanager
+import asyncio
+import json
+import os
+import io
+import random
+import time
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
 
-import uvloop
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
-import aiosqlite
-from fastapi import FastAPI, Query, HTTPException, Request, Header, Depends
-from fastapi.responses import JSONResponse
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from telethon import TelegramClient, events, functions
-from telethon.errors import FloodWaitError, RPCError
-from telethon.tl.types import Message
 import aiohttp
+import uvicorn
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from telethon import TelegramClient, events
+from telethon.errors import ChannelPrivateError, FloodWaitError, ChatAdminRequiredError
+from telethon.tl.types import Message, MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import GetHistoryRequest
 
-DB_PATH = "state.db"
+# ---------- Config (.env) ----------
 
-# ------------------- Config (.env) -------------------
 class Cfg(BaseSettings):
+    # Telegram API
     API_ID: int
     API_HASH: str
 
-    CALLBACK_URL: str
-    CALLBACK_BEARER: Optional[str] = None
+    # Callback
+    CALLBACK_URL: str = ""
+    CALLBACK_BEARER: str = ""
 
-    # security for HTTP API (optional)
-    API_BEARER: Optional[str] = None
+    # API security
+    API_BEARER: str = ""
 
-    # scan + throttling
+    # Scan/poll
     SCAN_INTERVAL_SEC: int = 60
     BATCH_MAX: int = 50
     BACKOFF_MIN_MS: int = 150
     BACKOFF_MAX_MS: int = 600
 
-    # session rescan + throttled joining
+    # Session rescan + join throttle
     SESS_RESCAN_SEC: int = 30
-    JOIN_INTERVAL_SEC: int = 300     # 5 phút
-    JOIN_JITTER_MS: int = 5000       # thêm 0-5s ngẫu nhiên
+    JOIN_INTERVAL_SEC: int = 300
+    JOIN_JITTER_MS: int = 5000
 
-    # alert to telegram bot (optional)
-    TELEGRAM_ALERT_BOT_TOKEN: Optional[str] = None
-    TELEGRAM_ALERT_CHAT_ID: Optional[str] = None
+    # Alerts
+    TELEGRAM_ALERT_BOT_TOKEN: str = ""
+    TELEGRAM_ALERT_CHAT_ID: str = ""
     TELEGRAM_ALERT_TOPIC_ID: Optional[int] = None
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        case_sensitive=True,
-    )
+    # Media
+    INCLUDE_MEDIA: bool = Field(default=False)
+    MEDIA_MAX_MB: float = Field(default=20.0)
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
 cfg = Cfg()
 
-# ------------------- Auth for HTTP API -------------------
-async def require_bearer(authorization: str = Header(default="")):
-    token = cfg.API_BEARER
-    if not token:
+# ---------- FastAPI ----------
+
+app = FastAPI(title="tg-pool")
+
+def require_bearer(req: Request):
+    if not cfg.API_BEARER:
         return
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer")
-    if authorization.split(" ", 1)[1].strip() != token:
-        raise HTTPException(status_code=403, detail="Invalid token")
+    auth = req.headers.get("authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != cfg.API_BEARER:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-# ------------------- Globals -------------------
-clients: List[Optional[TelegramClient]] = []
-session_files: List[str] = []
-db: aiosqlite.Connection = None
+# ---------- Paths & State ----------
 
-# cache: chat_id -> (name, sess_idx) ;   name -> (chat_id, sess_idx)
-managed_chats: Dict[int, Tuple[str, int]] = {}
-managed_names: Dict[str, Tuple[int, int]] = {}
+ROOT = Path("/opt/tg-pool")
+SESS_DIR = ROOT / "sessions"
+STATE_FILE = ROOT / "state.db"
 
-# join queue per session (join chậm 1 kênh/5 phút)
-join_queues: Dict[int, asyncio.Queue[str]] = {}
-join_workers_started: Dict[int, bool] = {}
+SESS_DIR.mkdir(parents=True, exist_ok=True)
 
-# alert dedupe
-session_alerted: Dict[str, bool] = {}  # sess_path -> alerted?
+_state_lock = asyncio.Lock()
+_state: Dict[str, Any] = {
+    "channels": {}  # name -> {chat_id, session_index, last_id}
+}
+if STATE_FILE.exists():
+    try:
+        _state.update(json.loads(STATE_FILE.read_text("utf-8")))
+    except Exception:
+        pass
 
-# ------------------- DB helpers -------------------
-async def db_init():
-    global db
-    db = await aiosqlite.connect(DB_PATH)
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS channels (
-            name TEXT PRIMARY KEY,
-            chat_id INTEGER NOT NULL,
-            session_index INTEGER NOT NULL,
-            last_id INTEGER NOT NULL DEFAULT 0,
-            session_path TEXT NOT NULL DEFAULT ''
-        )
-    """)
-    await db.commit()
+async def save_state():
+    async with _state_lock:
+        STATE_FILE.write_text(json.dumps(_state, ensure_ascii=False, indent=2), "utf-8")
 
-async def db_get_channel(name: str):
-    async with db.execute("SELECT name, chat_id, session_index, last_id, session_path FROM channels WHERE name=?", (name,)) as cur:
-        return await cur.fetchone()
+# ---------- Sessions ----------
 
-async def db_get_all_channels():
-    rows = []
-    async with db.execute("SELECT name, chat_id, session_index, last_id, session_path FROM channels") as cur:
-        async for r in cur:
-            rows.append(r)
-    return rows
+class SessionWrap:
+    def __init__(self, index: int, path: Path):
+        self.index = index
+        self.path = path
+        self.client: Optional[TelegramClient] = None
+        self.online: bool = False
+        self.next_join_ts: float = 0.0
 
-async def db_upsert_channel(name: str, chat_id: int, sess_idx: int, last_id: int, sess_path: str):
-    await db.execute("""
-      INSERT INTO channels(name, chat_id, session_index, last_id, session_path)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(name) DO UPDATE SET
-        chat_id=excluded.chat_id,
-        session_index=excluded.session_index,
-        last_id=excluded.last_id,
-        session_path=excluded.session_path
-    """, (name, chat_id, sess_idx, last_id, sess_path))
-    await db.commit()
+_sessions_lock = asyncio.Lock()
+_sessions: List[SessionWrap] = []  # stable order
+_session_by_path: Dict[str, SessionWrap] = {}
 
-async def db_update_last_id(name: str, last_id: int):
-    await db.execute("UPDATE channels SET last_id=? WHERE name=?", (last_id, name))
-    await db.commit()
+def list_session_files() -> List[Path]:
+    return sorted(SESS_DIR.glob("*.session"))
 
-async def db_update_mapping(name: str, sess_idx: int, sess_path: str):
-    await db.execute("UPDATE channels SET session_index=?, session_path=? WHERE name=?", (sess_idx, sess_path, name))
-    await db.commit()
+async def start_session(sw: SessionWrap):
+    if sw.client:
+        return
+    sw.client = TelegramClient(str(sw.path.with_suffix("")), cfg.API_ID, cfg.API_HASH)
+    await sw.client.connect()
+    if not await sw.client.is_user_authorized():
+        # không login -> bỏ qua
+        sw.online = False
+        await alert(f"❌ Session mới chưa authorized: {sw.path}")
+        return
+    sw.online = True
+    print(f"[+] Session[{sw.index}] sẵn sàng: {sw.path}")
 
-async def db_delete_channel(name: str):
-    await db.execute("DELETE FROM channels WHERE name=?", (name,))
-    await db.commit()
+async def stop_session(sw: SessionWrap):
+    try:
+        if sw.client:
+            await sw.client.disconnect()
+    except Exception:
+        pass
+    sw.client = None
+    sw.online = False
 
-# ------------------- Utils -------------------
-def normalize_name(s: str) -> str:
-    s = (s or "").strip()
-    if s.startswith("@"): s = s[1:]
-    return s
+async def rescan_sessions():
+    """Add/remove sessions based on files."""
+    async with _sessions_lock:
+        files = list_session_files()
+        paths = {str(p): p for p in files}
+        # remove
+        for p in list(_session_by_path.keys()):
+            if p not in paths:
+                sw = _session_by_path.pop(p)
+                try:
+                    await stop_session(sw)
+                finally:
+                    _sessions.remove(sw)
+                    await alert(f"🗑️ Session bị gỡ: {p}")
+        # add
+        existing = set(_session_by_path.keys())
+        for p in files:
+            sp = str(p)
+            if sp in existing:
+                continue
+            sw = SessionWrap(len(_sessions), p)
+            _sessions.append(sw)
+            _session_by_path[sp] = sw
+            try:
+                await start_session(sw)
+            except Exception:
+                sw.online = False
 
-def jitter_s(min_ms: int, max_ms: int) -> float:
-    return random.uniform(min_ms/1000, max_ms/1000)
-
-def pick_least_loaded_session(assignments: List[Tuple[str,int,int,int,str]]) -> int:
-    counts = [0]*len(clients)
-    for _,_,sess_idx,_,_ in assignments:
-        if 0 <= sess_idx < len(counts):
-            counts[sess_idx] += 1
-    best_idx, best_cnt = None, 1<<30
-    for i,cnt in enumerate(counts):
-        if clients[i] is None:
-            continue
-        if cnt < best_cnt:
-            best_cnt, best_idx = cnt, i
-    if best_idx is None:
-        raise RuntimeError("Không có session nào sẵn sàng.")
-    return best_idx
-
-async def http_post_json(url: str, payload: dict, headers: dict = None, timeout: int = 20):
-    h = {"Content-Type": "application/json"}
-    if headers: h.update(headers)
-    async with aiohttp.ClientSession() as sess:
-        async with sess.post(url, headers=h, json=payload, timeout=timeout) as resp:
-            return resp.status, await resp.text()
+# ---------- Alert to Telegram ----------
 
 async def alert(text: str):
     if not (cfg.TELEGRAM_ALERT_BOT_TOKEN and cfg.TELEGRAM_ALERT_CHAT_ID):
         return
     url = f"https://api.telegram.org/bot{cfg.TELEGRAM_ALERT_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": cfg.TELEGRAM_ALERT_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }
-    # gửi vào Topic nếu có
-    if os.getenv("TELEGRAM_ALERT_TOPIC_ID") or getattr(cfg, "TELEGRAM_ALERT_TOPIC_ID", None):
-        try:
-            topic_id = int(os.getenv("TELEGRAM_ALERT_TOPIC_ID") or cfg.TELEGRAM_ALERT_TOPIC_ID)
-            payload["message_thread_id"] = topic_id
-        except Exception:
-            pass
-
+    payload = {"chat_id": cfg.TELEGRAM_ALERT_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    if cfg.TELEGRAM_ALERT_TOPIC_ID:
+        payload["message_thread_id"] = int(cfg.TELEGRAM_ALERT_TOPIC_ID)
     try:
         async with aiohttp.ClientSession() as s:
             await s.post(url, json=payload, timeout=15)
     except Exception:
         pass
 
-# ------------------- Join queue (throttled) -------------------
-def ensure_join_worker(sess_idx: int):
-    if sess_idx not in join_queues:
-        join_queues[sess_idx] = asyncio.Queue()
-    if not join_workers_started.get(sess_idx):
-        asyncio.create_task(join_worker(sess_idx))
-        join_workers_started[sess_idx] = True
+# ---------- Utilities ----------
 
-async def join_worker(sess_idx: int):
-    q = join_queues[sess_idx]
-    while True:
-        try:
-            nm = await q.get()
-            cli = clients[sess_idx] if 0 <= sess_idx < len(clients) else None
-            if cli is None:
-                # session hiện không online -> đẩy lại và chờ
-                await asyncio.sleep(5)
-                await q.put(nm)
-                continue
-            try:
-                entity = None
-                try:
-                    entity = await cli.get_entity(nm)
-                except Exception:
-                    entity = None
-                if entity is None:
-                    await cli(functions.channels.JoinChannelRequest(nm))
-                    entity = await cli.get_entity(nm)
-
-                row = await db_get_channel(nm)
-                if row:
-                    name, chat_id, _, last_id, _sess_path = row
-                    await db_update_mapping(name, sess_idx, session_files[sess_idx])
-                    managed_chats[chat_id] = (name, sess_idx)
-                    managed_names[name] = (chat_id, sess_idx)
-                    print(f"[JoinQueue] {nm} -> session[{sess_idx}] OK")
-                    await alert(f"✅ Đã join lại kênh {nm} bằng session[{sess_idx}]")
-            except Exception as e:
-                print(f"[JoinQueue WARN] {nm} @sess[{sess_idx}]: {e}")
-                await alert(f"⚠️ Join {nm} @sess[{sess_idx}] lỗi: {e}")
-
-            sleep_s = cfg.JOIN_INTERVAL_SEC + random.uniform(0, cfg.JOIN_JITTER_MS/1000)
-            await asyncio.sleep(sleep_s)
-        except Exception as e:
-            print("[join_worker] ERR:", e)
-            await asyncio.sleep(3)
-
-# ------------------- Telethon handlers -------------------
-async def on_new_message(event: events.NewMessage.Event, sess_idx: int):
-    try:
-        m: Message = event.message
-        chat_id = m.chat_id
-        if chat_id not in managed_chats:
-            return
-        ch_name, assigned_idx = managed_chats[chat_id]
-        if assigned_idx != sess_idx:
-            return
-        row = await db_get_channel(ch_name)
-        if not row:
-            return
-        _, _, _, last_id, _ = row
-        if m.id <= last_id:
-            return
-        await db_update_last_id(ch_name, m.id)
-        headers = {}
-        if cfg.CALLBACK_BEARER:
-            headers["Authorization"] = f"Bearer {cfg.CALLBACK_BEARER}"
-        st, body = await http_post_json(cfg.CALLBACK_URL, serialize_message(m, ch_name), headers=headers)
-        if st >= 300:
-            print(f"[CALLBACK] {st} {body}")
-        await asyncio.sleep(jitter_s(cfg.BACKOFF_MIN_MS, cfg.BACKOFF_MAX_MS))
-    except FloodWaitError as e:
-        print(f"[FloodWait] sess={sess_idx} {e.seconds}s")
-        await asyncio.sleep(e.seconds + 1)
-    except Exception as e:
-        print("[on_new_message] error:", e)
-        traceback.print_exc()
-
-async def register_handlers(sess_idx: int):
-    cli = clients[sess_idx]
-    if cli is None: return
-    @cli.on(events.NewMessage)
-    async def _handler(event):
-        await on_new_message(event, sess_idx)
-
-# ------------------- Periodic catch-up -------------------
-async def periodic_scan():
-    await asyncio.sleep(2)
-    while True:
-        try:
-            rows = await db_get_all_channels()
-            per_session: Dict[int, List[str]] = {}
-            for name, chat_id, sess_idx, last_id, _p in rows:
-                per_session.setdefault(sess_idx, []).append(name)
-
-            for sess_idx, names in per_session.items():
-                cli = clients[sess_idx]
-                if cli is None:
-                    continue
-                for nm in names:
-                    try:
-                        entity = await cli.get_entity(nm)
-                        msgs = await cli.get_messages(entity, limit=cfg.BATCH_MAX)
-                        if not msgs:
-                            continue
-                        msgs.sort(key=lambda x: x.id)
-                        row = await db_get_channel(nm)
-                        if not row:
-                            continue
-                        _, _, _, last_id, _ = row
-                        new_msgs = [m for m in msgs if m.id > last_id]
-                        for m in new_msgs:
-                            await db_update_last_id(nm, m.id)
-                            headers = {}
-                            if cfg.CALLBACK_BEARER:
-                                headers["Authorization"] = f"Bearer {cfg.CALLBACK_BEARER}"
-                            st, body = await http_post_json(cfg.CALLBACK_URL, serialize_message(m, nm), headers=headers)
-                            if st >= 300:
-                                print(f"[CALLBACK] {st} {body}")
-                            await asyncio.sleep(jitter_s(cfg.BACKOFF_MIN_MS, cfg.BACKOFF_MAX_MS))
-                        await asyncio.sleep(jitter_s(cfg.BACKOFF_MIN_MS, cfg.BACKOFF_MAX_MS))
-                    except FloodWaitError as e:
-                        print(f"[Scan FloodWait] sess={sess_idx} {nm} {e.seconds}s")
-                        await asyncio.sleep(e.seconds + 1)
-                    except Exception as e:
-                        print(f"[Scan ERR] sess={sess_idx} {nm}: {e}")
-                        await asyncio.sleep(0.2)
-            await asyncio.sleep(cfg.SCAN_INTERVAL_SEC)
-        except Exception as e:
-            print("[periodic_scan] ERR:", e)
-            await asyncio.sleep(3)
-
-# ------------------- Session bootstrap -------------------
-async def start_sessions():
-    global session_files
-    session_files = sorted(glob.glob(os.path.join("sessions", "*.session")))
-    if not session_files:
-        print("[*] Không tìm thấy file .session trong ./sessions — API vẫn chạy, nhưng chưa có session.")
-
-    for i, sess_path in enumerate(session_files):
-        cli = TelegramClient(sess_path, cfg.API_ID, cfg.API_HASH)
-        await cli.connect()
-        if not await cli.is_user_authorized():
-            print(f"[*] {sess_path}: CHƯA ĐĂNG NHẬP → skip")
-            await alert(f"❌ Session not authorized: {sess_path}")
-            await cli.disconnect()
-            clients.append(None)
-            session_alerted[sess_path] = True
+def choose_session_for_new_channel() -> Optional[SessionWrap]:
+    # pick session online with min current assigned channels count
+    counts = {sw.index: 0 for sw in _sessions if sw.online}
+    for ch in _state["channels"].values():
+        idx = ch.get("session_index")
+        if idx in counts:
+            counts[idx] += 1
+    best_idx = None
+    best_count = 10**9
+    for sw in _sessions:
+        if not sw.online:
             continue
-        clients.append(cli)
-        await register_handlers(i)
-        ensure_join_worker(i)
-        print(f"[+] Session[{i}] sẵn sàng: {sess_path}")
+        c = counts.get(sw.index, 0)
+        if c < best_count:
+            best_count = c
+            best_idx = sw.index
+    return next((s for s in _sessions if s.index == best_idx), None)
 
-    # map lại theo session_path nếu index lệch
-    rows = await db_get_all_channels()
-    for name, chat_id, sess_idx, _last, sess_path in rows:
-        if sess_path and sess_path in session_files:
-            new_idx = session_files.index(sess_path)
-            if new_idx != sess_idx:
-                await db_update_mapping(name, new_idx, sess_path)
-                sess_idx = new_idx
-        managed_chats[chat_id] = (name, sess_idx)
-        managed_names[name] = (chat_id, sess_idx)
-        ensure_join_worker(sess_idx)
+async def ensure_join(sw: SessionWrap, channel: str):
+    """Join channel with throttle."""
+    now = time.time()
+    if now < sw.next_join_ts:
+        await asyncio.sleep(sw.next_join_ts - now)
+    # jitter
+    jitter = random.uniform(0, cfg.JOIN_JITTER_MS / 1000.0)
+    await asyncio.sleep(jitter)
+    try:
+        ent = await sw.client.get_entity(channel)
+        # nếu chưa là member, JoinChannelRequest sẽ đảm bảo
+        await sw.client(JoinChannelRequest(ent))
+    except ChannelPrivateError:
+        # kênh private không join được bằng username
+        pass
+    except ChatAdminRequiredError:
+        pass
+    except FloodWaitError as e:
+        await alert(f"⏳ FloodWait {int(e.seconds)}s khi join {channel} (sess {sw.index})")
+        await asyncio.sleep(e.seconds)
+    except Exception:
+        # ignore
+        pass
+    # set next join time
+    sw.next_join_ts = time.time() + cfg.JOIN_INTERVAL_SEC
 
-# ------------------- Monitor sessions (health + alert) -------------------
+def last_id_of(name: str) -> int:
+    info = _state["channels"].get(name) or {}
+    return int(info.get("last_id") or 0)
+
+def set_last_id(name: str, mid: int):
+    if name in _state["channels"]:
+        _state["channels"][name]["last_id"] = int(mid)
+
+def _is_allowed_doc(doc) -> bool:
+    mt = (getattr(doc, "mime_type", "") or "").lower()
+    if not mt:
+        return False
+    if mt.startswith("image/") or mt.startswith("video/"):
+        return True
+    return False
+
+# ---------- Callback building (JSON or multipart with media) ----------
+
+MEDIA_MAX_BYTES = int(cfg.MEDIA_MAX_MB * 1024 * 1024)
+
+async def build_payload_and_files(client: TelegramClient, msg: Message, channel_username: Optional[str]):
+    payload = {
+        "source": "telegram",
+        "channel": (channel_username or "").lstrip("@"),
+        "message": {
+            "chat_id": msg.chat_id,
+            "message_id": msg.id,
+            "date": msg.date.isoformat() if getattr(msg, "date", None) else None,
+            "text": msg.message or "",
+            "views": getattr(msg, "views", None),
+            "forwards": getattr(msg, "forwards", None),
+            "reply_to_msg_id": getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None),
+        },
+        "media": []
+    }
+    if channel_username:
+        payload["post_url"] = f"https://t.me/{(channel_username or '').lstrip('@')}/{msg.id}"
+
+    if not cfg.INCLUDE_MEDIA:
+        return payload, None
+
+    files: List[Tuple[str, Tuple[str, bytes, str]]] = []
+    mi = 0
+
+    if isinstance(msg.media, MessageMediaPhoto):
+        buf = io.BytesIO()
+        try:
+            await client.download_media(msg, file=buf)
+            data = buf.getvalue()
+            if data and len(data) <= MEDIA_MAX_BYTES:
+                fname = f"photo_{msg.id}.jpg"
+                payload["media"].append({
+                    "type": "photo",
+                    "mime": "image/jpeg",
+                    "file_name": fname,
+                    "size": len(data)
+                })
+                files.append((f"media{mi}", (fname, data, "image/jpeg"))); mi += 1
+        except Exception:
+            pass
+
+    elif isinstance(msg.media, MessageMediaDocument) and msg.media.document:
+        doc = msg.media.document
+        if _is_allowed_doc(doc):
+            mime = (doc.mime_type or "application/octet-stream").lower()
+            name = None
+            for a in (doc.attributes or []):
+                if hasattr(a, "file_name") and a.file_name:
+                    name = a.file_name
+                    break
+            if not name:
+                name = f"{'video' if mime.startswith('video/') else 'image'}_{msg.id}"
+            buf = io.BytesIO()
+            try:
+                await client.download_media(msg, file=buf)
+                data = buf.getvalue()
+                if data and len(data) <= MEDIA_MAX_BYTES:
+                    payload["media"].append({
+                        "type": "video" if mime.startswith("video/") else "image",
+                        "mime": mime,
+                        "file_name": name,
+                        "size": len(data)
+                    })
+                    files.append((f"media{mi}", (name, data, mime))); mi += 1
+            except Exception:
+                pass
+
+    return payload, (files if files else None)
+
+async def send_callback(payload: dict, files: Optional[List[Tuple[str, Tuple[str, bytes, str]]]]):
+    if not cfg.CALLBACK_URL:
+        return
+    headers = {}
+    if cfg.CALLBACK_BEARER:
+        headers["Authorization"] = f"Bearer {cfg.CALLBACK_BEARER}"
+    async with aiohttp.ClientSession() as s:
+        if files:
+            form = aiohttp.FormData()
+            form.add_field("json", json.dumps(payload), content_type="application/json")
+            for fn, (fname, data, mime) in files:
+                form.add_field(fn, data, filename=fname, content_type=mime)
+            await s.post(cfg.CALLBACK_URL, data=form, headers=headers, timeout=30)
+        else:
+            await s.post(cfg.CALLBACK_URL, json=payload, headers=headers, timeout=30)
+
+# ---------- Poll loop ----------
+
+async def poll_loop():
+    while True:
+        try:
+            # build map session_index -> [channels]
+            assign: Dict[int, List[str]] = {}
+            for name, meta in _state["channels"].items():
+                idx = int(meta.get("session_index", -1))
+                assign.setdefault(idx, []).append(name)
+
+            tasks = []
+            for sw in list(_sessions):
+                if not sw.online or not sw.client:
+                    continue
+                chs = assign.get(sw.index, [])
+                if not chs:
+                    continue
+                tasks.append(_poll_one_session(sw, chs))
+            if tasks:
+                await asyncio.gather(*tasks)
+        except Exception as e:
+            # keep looping
+            pass
+        await asyncio.sleep(cfg.SCAN_INTERVAL_SEC)
+
+async def _poll_one_session(sw: SessionWrap, ch_names: List[str]):
+    client = sw.client
+    for name in ch_names:
+        await asyncio.sleep(random.uniform(cfg.BACKOFF_MIN_MS/1000.0, cfg.BACKOFF_MAX_MS/1000.0))
+        try:
+            entity = await client.get_entity(name)
+            # get new messages strictly after last_id
+            last_id = last_id_of(name)
+            # Using GetHistoryRequest to control min_id
+            res = await client(GetHistoryRequest(
+                peer=entity,
+                offset_id=0,
+                offset_date=None,
+                add_offset=0,
+                limit=cfg.BATCH_MAX,
+                max_id=0,
+                min_id=last_id,
+                hash=0
+            ))
+            messages: List[Message] = list(res.messages or [])
+            if not messages:
+                continue
+            # sort ascending by id
+            messages.sort(key=lambda m: m.id or 0)
+            # push each
+            for m in messages:
+                if not m.id or m.id <= last_id:
+                    continue
+                # build payload (+ media)
+                payload, files = await build_payload_and_files(client, m, name)
+                await send_callback(payload, files)
+                set_last_id(name, m.id)
+            await save_state()
+        except FloodWaitError as e:
+            await alert(f"⏳ FloodWait {int(e.seconds)}s khi đọc {name} (sess {sw.index})")
+            await asyncio.sleep(e.seconds)
+        except ChannelPrivateError:
+            # cannot access -> skip
+            continue
+        except Exception:
+            # ignore single channel errors
+            continue
+
+# ---------- Session monitor loop ----------
+
 async def monitor_sessions():
     while True:
         try:
-            for i, sess_path in enumerate(session_files):
-                cli = clients[i] if i < len(clients) else None
-                ok = (cli is not None)
-                if ok:
-                    try:
-                        if not await cli.is_user_authorized():
-                            ok = False
-                    except Exception:
-                        ok = False
-                if not ok:
-                    if not session_alerted.get(sess_path):
-                        await alert(f"❌ Session die hoặc mất quyền: {sess_path} (idx {i}) — cần thay thế.")
-                        session_alerted[sess_path] = True
-                else:
-                    # reset alert flag nếu đã hồi
-                    session_alerted[sess_path] = False
-            await asyncio.sleep(60)
-        except Exception:
-            await asyncio.sleep(5)
-
-# ------------------- Rescan sessions + Reassign -------------------
-async def rescan_sessions_loop():
-    await asyncio.sleep(5)
-    known = set(session_files)
-    while True:
-        try:
-            current_list = sorted(glob.glob(os.path.join("sessions", "*.session")))
-            current = set(current_list)
-            added = list(current - known)
-            removed = list(known - current)
-
-            # Added sessions
-            for sess_path in added:
-                i = len(clients)
-                cli = TelegramClient(sess_path, cfg.API_ID, cfg.API_HASH)
-                await cli.connect()
-                if not await cli.is_user_authorized():
-                    print(f"[*] {sess_path}: CHƯA ĐĂNG NHẬP (bỏ).")
-                    await alert(f"❌ Session mới chưa authorized: {sess_path}")
-                    await cli.disconnect()
+            # rescan files, add/remove sessions
+            await rescan_sessions()
+            # check authorizations
+            for sw in list(_sessions):
+                if not sw.client:
                     continue
-                clients.append(cli)
-                session_files.append(sess_path)
-                await register_handlers(i)
-                ensure_join_worker(i)
-                print(f"[+] Session[{i}] thêm mới: {sess_path}")
-                await alert(f"🆕 Thêm session mới: {sess_path} (idx {i})")
-
-            # Removed sessions
-            for dead_path in removed:
-                if dead_path in session_files:
-                    idx = session_files.index(dead_path)
-                    try:
-                        if clients[idx] is not None:
-                            await clients[idx].disconnect()
-                    except: pass
-                    clients[idx] = None
-                    print(f"[-] Session[{idx}] đã gỡ: {dead_path}")
-                    await alert(f"🗑️ Session bị gỡ: {dead_path} (idx {idx})")
-
-                    rows = await db_get_all_channels()
-                    victims = [r for r in rows if r[2] == idx]  # (name, chat_id, sess_idx, last_id, sess_path)
-
-                    preferred_idx = None
-                    if len(added) == 1 and added[0] in session_files:
-                        preferred_idx = session_files.index(added[0])
-
-                    for name, chat_id, _sess_idx, _last_id, _path_db in victims:
-                        try:
-                            if preferred_idx is not None and clients[preferred_idx] is not None:
-                                new_idx = preferred_idx
-                            else:
-                                alive_rows = [r for r in rows if clients[r[2]] is not None and r[2] != idx]
-                                new_idx = pick_least_loaded_session(alive_rows)
-
-                            ensure_join_worker(new_idx)
-                            await join_queues[new_idx].put(name)
-                            await db_update_mapping(name, new_idx, session_files[new_idx])
-                            managed_chats[chat_id] = (name, new_idx)
-                            managed_names[name] = (chat_id, new_idx)
-                            print(f"[Reassign queued] {name} -> session[{new_idx}]")
-                            await alert(f"🔁 Chuyển {name} -> session[{new_idx}], sẽ join chậm.")
-                        except Exception as e:
-                            print(f"[Reassign ERR] {name}: {e}")
-                            await alert(f"❗ Reassign {name} lỗi: {e}")
-
-            known = set(session_files := current_list)
-            await asyncio.sleep(cfg.SESS_RESCAN_SEC)
-        except Exception as e:
-            print("[rescan_sessions_loop] ERR:", e)
-            await asyncio.sleep(3)
-
-# ------------------- FastAPI lifespan -------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await db_init()
-    await start_sessions()
-    asyncio.create_task(periodic_scan())
-    asyncio.create_task(rescan_sessions_loop())
-    asyncio.create_task(monitor_sessions())
-    yield
-    try:
-        if db: await db.close()
-        for c in clients:
-            if c: await c.disconnect()
-    except:
-        pass
-
-app = FastAPI(title="TG Pool Poller", version="1.4", lifespan=lifespan)
-
-# ------------------- HTTP API -------------------
-@app.get("/channel")
-async def add_channel(name: str = Query(..., alias="chanel"),
-                      _dep: None = Depends(require_bearer)):
-    nm = normalize_name(name)
-    if await db_get_channel(nm):
-        row = await db_get_channel(nm)
-        return {"ok": True, "msg": "exists", "channel": nm, "session_index": row[2]}
-
-    rows = await db_get_all_channels()
-    sess_idx = pick_least_loaded_session(rows)
-    cli = clients[sess_idx]
-    if cli is None:
-        raise HTTPException(503, "Không có session sẵn sàng (chưa đăng nhập).")
-
-    try:
-        entity = None
-        try:
-            entity = await cli.get_entity(nm)
+                try:
+                    ok = await sw.client.is_user_authorized()
+                except Exception:
+                    ok = False
+                if not ok and sw.online:
+                    sw.online = False
+                    await alert(f"❌ Session die/not authorized: {sw.path}")
+                    # reassign channels that were on this session
+                    # they will be migrated lazily on next /channel calls or rescheduling
+                    # (no-op here, keep mapping; next choose_session_for_new_channel will skip offline)
         except Exception:
-            entity = None
-        if entity is None:
-            await cli(functions.channels.JoinChannelRequest(nm))
-            entity = await cli.get_entity(nm)
-    except RPCError as e:
-        raise HTTPException(400, f"Join/get entity lỗi: {e.__class__.__name__}")
-    except Exception as e:
-        raise HTTPException(400, f"Lỗi khác khi join/get entity: {str(e)}")
+            pass
+        await asyncio.sleep(cfg.SESS_RESCAN_SEC)
 
-    chat_id = int(getattr(entity, "id", 0) or 0)
-    if not chat_id:
-        raise HTTPException(400, "Không lấy được chat_id.")
-
-    msgs = await cli.get_messages(entity, limit=1)
-    last_id = msgs[0].id if msgs else 0
-
-    sess_path = session_files[sess_idx]
-    await db_upsert_channel(nm, chat_id, sess_idx, last_id, sess_path)
-    managed_chats[chat_id] = (nm, sess_idx)
-    managed_names[nm] = (chat_id, sess_idx)
-
-    return {"ok": True, "channel": nm, "chat_id": chat_id, "session_index": sess_idx, "last_id": last_id}
-
-@app.get("/delete")
-async def delete_channel(channel: str = Query(..., alias="chanel"),
-                         _dep: None = Depends(require_bearer)):
-    nm = normalize_name(channel)
-    row = await db_get_channel(nm)
-    if not row:
-        return {"ok": True, "msg": "not_found"}
-    _, chat_id, sess_idx, _last, _path = row
-
-    cli = clients[sess_idx] if 0 <= sess_idx < len(clients) else None
-    if cli is not None:
-        try:
-            await cli(functions.channels.LeaveChannelRequest(channel=nm))
-        except Exception as e:
-            print(f"[Leave WARN] {nm}: {e}")
-
-    await db_delete_channel(nm)
-    managed_chats.pop(chat_id, None)
-    managed_names.pop(nm, None)
-    return {"ok": True, "msg": "deleted"}
+# ---------- API ----------
 
 @app.get("/status")
-async def status(_dep: None = Depends(require_bearer)):
-    rows = await db_get_all_channels()
-    return {
-        "ok": True,
-        "sessions": [
-            {"index": i, "online": (clients[i] is not None), "path": session_files[i] if i < len(session_files) else None}
-            for i in range(len(session_files))
-        ],
-        "channels": [
-            {"name": r[0], "chat_id": r[1], "session_index": r[2], "last_id": r[3], "session_path": r[4]}
-            for r in rows
+async def status(_: Any = Depends(require_bearer)):
+    async with _sessions_lock:
+        sess = [
+            {"index": sw.index, "online": sw.online, "path": f"sessions/{Path(sw.path).name}"}
+            for sw in _sessions
         ]
-    }
+    chs = []
+    for name, meta in _state["channels"].items():
+        chs.append({
+            "name": name,
+            "chat_id": meta.get("chat_id"),
+            "session_index": meta.get("session_index"),
+            "last_id": meta.get("last_id"),
+            "session_path": str(f"sessions/{Path(_sessions[meta['session_index']].path).name}") if isinstance(meta.get("session_index"), int) and 0 <= meta["session_index"] < len(_sessions) else None
+        })
+    return {"ok": True, "sessions": sess, "channels": chs}
 
-@app.exception_handler(Exception)
-async def on_any_exception(request: Request, exc: Exception):
-    print("[HTTP ERR]", request.url, repr(exc))
-    return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+@app.get("/")
+async def root():
+    return JSONResponse({"ok": False, "hint": "see /status"})
 
-# ------------------- Entrypoint -------------------
+@app.get("/channel")
+async def add_channel(chanel: str = Query(..., alias="chanel"), _: Any = Depends(require_bearer)):
+    name = chanel.lstrip("@")
+    # pick session
+    sw = choose_session_for_new_channel()
+    if not sw:
+        raise HTTPException(503, "No online session available")
+    try:
+        await ensure_join(sw, name)
+        # fetch last message id to set last_id baseline
+        ent = await sw.client.get_entity(name)
+        hist = await sw.client(GetHistoryRequest(
+            peer=ent, offset_id=0, offset_date=None, add_offset=0,
+            limit=1, max_id=0, min_id=0, hash=0
+        ))
+        last = 0
+        if hist.messages:
+            last = hist.messages[0].id or 0
+        _state["channels"][name] = {
+            "chat_id": getattr(ent, "id", None),
+            "session_index": sw.index,
+            "last_id": last
+        }
+        await save_state()
+        return {"ok": True, "channel": name, "session_index": sw.index, "last_id": last}
+    except FloodWaitError as e:
+        await alert(f"⏳ FloodWait {int(e.seconds)}s khi join {name} (sess {sw.index})")
+        raise HTTPException(429, f"FloodWait {int(e.seconds)}s")
+    except Exception as e:
+        raise HTTPException(500, f"join/add failed: {e}")
+
+@app.get("/delete")
+async def delete_channel(chanel: str = Query(..., alias="chanel"), _: Any = Depends(require_bearer)):
+    name = chanel.lstrip("@")
+    meta = _state["channels"].get(name)
+    if not meta:
+        return {"ok": True, "removed": False}
+    idx = int(meta.get("session_index", -1))
+    sw = next((s for s in _sessions if s.index == idx and s.client), None)
+    try:
+        if sw and sw.client:
+            ent = await sw.client.get_entity(name)
+            await sw.client(LeaveChannelRequest(ent))
+    except Exception:
+        pass
+    _state["channels"].pop(name, None)
+    await save_state()
+    return {"ok": True, "removed": True}
+
+# ---------- Lifespan ----------
+
+@app.on_event("startup")
+async def on_startup():
+    await rescan_sessions()
+    # background tasks
+    asyncio.create_task(monitor_sessions())
+    asyncio.create_task(poll_loop())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    async with _sessions_lock:
+        for sw in _sessions:
+            try:
+                await stop_session(sw)
+            except Exception:
+                pass
+
+# ---------- Main ----------
+
 if __name__ == "__main__":
-    import uvicorn
-    # Bind 0.0.0.0 nếu bạn muốn gọi từ ngoài; an toàn hơn: 127.0.0.1 + SSH tunnel/Cloudflare Tunnel
+    # Bind public (0.0.0.0). Nếu muốn chỉ nội bộ: host="127.0.0.1"
     uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=False, log_level="info")
