@@ -1,4 +1,4 @@
-# app.py — VPS poll-only -> callback worker /post-new
+# app.py — VPS poll-only -> Worker /post-new
 import asyncio, json, os, io, random, re, time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -21,12 +21,12 @@ class Cfg(BaseSettings):
     API_ID: int
     API_HASH: str
 
-    # Worker callback (điểm Worker /post-new)
-    CALLBACK_URL: str = ""          # ví dụ: https://telegram.faker.today/post-new
-    CALLBACK_BEARER: str = ""       # Bearer kèm khi gửi về Worker
+    # Worker callback (/post-new)
+    CALLBACK_URL: str = ""
+    CALLBACK_BEARER: str = ""
 
-    # Bảo vệ API VPS
-    API_BEARER: str = ""            # Bearer để gọi /channel, /delete, /status
+    # Protect VPS APIs
+    API_BEARER: str = ""
 
     # Polling & throttle
     SCAN_INTERVAL_SEC: int = 60
@@ -43,7 +43,12 @@ class Cfg(BaseSettings):
     INCLUDE_MEDIA: bool = Field(default=True)
     MEDIA_MAX_MB: float = Field(default=20.0)
 
-    # Bind host/port
+    # Alerts
+    TELEGRAM_ALERT_BOT_TOKEN: str = ""
+    TELEGRAM_ALERT_CHAT_ID: str = ""
+    TELEGRAM_ALERT_TOPIC_ID: Optional[int] = None
+
+    # Bind
     BIND_HOST: str = Field(default="0.0.0.0")
     BIND_PORT: int = Field(default=8080)
 
@@ -54,7 +59,7 @@ class Cfg(BaseSettings):
 cfg = Cfg()
 
 # ============ FastAPI ============
-app = FastAPI(title="tg-pool (poll-only)")
+app = FastAPI(title="tg-pool (poll-only w/ reassignment & alerts)")
 
 def require_bearer(req: Request):
     if not cfg.API_BEARER:
@@ -96,6 +101,25 @@ _sessions_lock = asyncio.Lock()
 def list_session_files() -> List[Path]:
     return sorted(SESS_DIR.glob("*.session"))
 
+# ============ Alerts ============
+async def alert(text: str):
+    if not (cfg.TELEGRAM_ALERT_BOT_TOKEN and cfg.TELEGRAM_ALERT_CHAT_ID):
+        return
+    url = f"https://api.telegram.org/bot{cfg.TELEGRAM_ALERT_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": cfg.TELEGRAM_ALERT_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True
+    }
+    if cfg.TELEGRAM_ALERT_TOPIC_ID:
+        payload["message_thread_id"] = int(cfg.TELEGRAM_ALERT_TOPIC_ID)
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(url, json=payload, timeout=15)
+    except Exception:
+        pass
+
+# ============ Session lifecycle ============
 async def start_session(sw: SessionWrap):
     if sw.client:
         return
@@ -103,10 +127,10 @@ async def start_session(sw: SessionWrap):
     await sw.client.connect()
     if not await sw.client.is_user_authorized():
         sw.online = False
-        print(f"[!] Session NOT authorized: {sw.path.name}")
+        await alert(f"❌ Session NOT authorized: `{sw.path.name}`")
         return
     sw.online = True
-    print(f"[+] Session[{sw.index}] ready: {sw.path.name}")
+    await alert(f"🟢 Session online: `#{sw.index}` ({sw.path.name})")
 
 async def stop_session(sw: SessionWrap):
     try:
@@ -115,21 +139,91 @@ async def stop_session(sw: SessionWrap):
     except Exception:
         pass
     sw.client = None
+    if sw.online:
+        await alert(f"🔴 Session offline: `#{sw.index}` ({sw.path.name})")
     sw.online = False
+
+def _online_sessions():
+    return [sw for sw in _sessions if sw.online]
+
+def _channel_counts():
+    counts = {sw.index: 0 for sw in _sessions if sw.online}
+    for meta in _state["channels"].values():
+        idx = meta.get("session_index")
+        if isinstance(idx, int) and idx in counts:
+            counts[idx] += 1
+    return counts
+
+def _pick_least_loaded() -> Optional[SessionWrap]:
+    counts = _channel_counts()
+    best = None
+    best_count = 10**9
+    for sw in _online_sessions():
+        c = counts.get(sw.index, 0)
+        if c < best_count:
+            best, best_count = sw, c
+    return best
+
+async def ensure_join(sw: SessionWrap, channel: str):
+    """Join channel with throttle + jitter + alerts."""
+    now = time.time()
+    if now < sw.next_join_ts:
+        await asyncio.sleep(sw.next_join_ts - now)
+    jitter = random.uniform(0, cfg.JOIN_JITTER_MS / 1000.0)
+    await asyncio.sleep(jitter)
+    try:
+        ent = await sw.client.get_entity(channel)
+        await sw.client(JoinChannelRequest(ent))
+        await alert(f"✅ Joined @{channel} on session `#{sw.index}`")
+    except ChannelPrivateError:
+        await alert(f"⚠️ Private/deny join @{channel} on session `#{sw.index}`")
+    except ChatAdminRequiredError:
+        await alert(f"⚠️ Admin required @{channel} on session `#{sw.index}`")
+    except FloodWaitError as e:
+        await alert(f"⏳ FloodWait {int(e.seconds)}s when join @{channel} (sess `#{sw.index}`)")
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        await alert(f"⚠️ Join error @{channel} on sess `#{sw.index}`: {e}")
+    sw.next_join_ts = time.time() + cfg.JOIN_INTERVAL_SEC
+
+async def _reassign_channel(name: str, target_sw: SessionWrap):
+    """Move channel to target session (ensure join) with alert."""
+    meta = _state["channels"].get(name)
+    if not meta:
+        return
+    await ensure_join(target_sw, name)
+    old_idx = meta.get("session_index")
+    meta["session_index"] = target_sw.index
+    await save_state()
+    await alert(f"🔁 Reassigned @{name} from sess `#{old_idx}` → `#{target_sw.index}`")
 
 async def rescan_sessions():
     async with _sessions_lock:
         files = list_session_files()
         paths = {str(p): p for p in files}
+
         # remove
         for p in list(_session_by_path.keys()):
             if p not in paths:
                 sw = _session_by_path.pop(p)
+
+                # move channels away from removed session
+                lost_idx = sw.index
+                victims = [name for name, meta in _state["channels"].items()
+                           if meta.get("session_index") == lost_idx]
+                moved = 0
+                for ch_name in victims:
+                    dst = _pick_least_loaded()
+                    if dst:
+                        await _reassign_channel(ch_name, dst)
+                        moved += 1
+
                 try:
                     await stop_session(sw)
                 finally:
                     _sessions.remove(sw)
-                    print(f"[-] Session removed: {Path(p).name}")
+                    await alert(f"🗑️ Session removed: `#{lost_idx}` ({Path(p).name}), moved {moved} channel(s)")
+
         # add
         existing = set(_session_by_path.keys())
         for p in files:
@@ -144,52 +238,24 @@ async def rescan_sessions():
             except Exception:
                 sw.online = False
 
-def choose_session_for_new_channel() -> Optional[SessionWrap]:
-    counts = {sw.index: 0 for sw in _sessions if sw.online}
-    for ch in _state["channels"].values():
-        idx = ch.get("session_index")
-        if isinstance(idx, int) and idx in counts:
-            counts[idx] += 1
-    best_idx, best_count = None, 10**9
-    for sw in _sessions:
-        if not sw.online:
-            continue
-        c = counts.get(sw.index, 0)
-        if c < best_count:
-            best_count, best_idx = c, sw.index
-    return next((s for s in _sessions if s.index == best_idx), None)
+        # light rebalance (optional)
+        counts = _channel_counts()
+        if counts:
+            avg = (sum(counts.values()) / max(len(counts), 1)) or 0
+            for src_sw in _online_sessions():
+                while counts.get(src_sw.index, 0) > avg + 1:
+                    cand = next((n for n, m in _state["channels"].items()
+                                 if m.get("session_index") == src_sw.index), None)
+                    if not cand:
+                        break
+                    dst = _pick_least_loaded()
+                    if not dst or dst.index == src_sw.index:
+                        break
+                    await _reassign_channel(cand, dst)
+                    counts[src_sw.index] -= 1
+                    counts[dst.index] = counts.get(dst.index, 0) + 1
 
-async def ensure_join(sw: SessionWrap, channel: str):
-    now = time.time()
-    if now < sw.next_join_ts:
-        await asyncio.sleep(sw.next_join_ts - now)
-    jitter = random.uniform(0, cfg.JOIN_JITTER_MS / 1000.0)
-    await asyncio.sleep(jitter)
-    try:
-        ent = await sw.client.get_entity(channel)
-        await sw.client(JoinChannelRequest(ent))
-    except (ChannelPrivateError, ChatAdminRequiredError):
-        pass
-    except FloodWaitError as e:
-        print(f"[FW] join {channel}: wait {e.seconds}s")
-        await asyncio.sleep(e.seconds)
-    except Exception:
-        pass
-    sw.next_join_ts = time.time() + cfg.JOIN_INTERVAL_SEC
-
-def last_id_of(name: str) -> int:
-    info = _state["channels"].get(name) or {}
-    return int(info.get("last_id") or 0)
-
-def set_last_id(name: str, mid: int):
-    if name in _state["channels"]:
-        _state["channels"][name]["last_id"] = int(mid)
-
-def _is_allowed_doc(doc) -> bool:
-    mt = (getattr(doc, "mime_type", "") or "").lower()
-    return bool(mt and (mt.startswith("image/") or mt.startswith("video/")))
-
-# ============ Build payload/files ============
+# ============ Text & media helpers ============
 MEDIA_MAX_BYTES = int(cfg.MEDIA_MAX_MB * 1024 * 1024)
 
 def _strip_urls_keep_lines(s: str) -> str:
@@ -199,6 +265,10 @@ def _strip_urls_keep_lines(s: str) -> str:
     s = re.sub(r"[ \t]+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
+def _is_allowed_doc(doc) -> bool:
+    mt = (getattr(doc, "mime_type", "") or "").lower()
+    return bool(mt and (mt.startswith("image/") or mt.startswith("video/")))
 
 async def build_payload_and_files(client: TelegramClient, msg: Message, channel_username: Optional[str]):
     payload = {
@@ -210,7 +280,7 @@ async def build_payload_and_files(client: TelegramClient, msg: Message, channel_
             "message_id": msg.id,
             "grouped_id": getattr(msg, "grouped_id", None),
             "date": msg.date.isoformat() if getattr(msg, "date", None) else None,
-            "text": msg.message or "",
+            "text": _strip_urls_keep_lines(msg.message or ""),
             "views": getattr(msg, "views", None),
             "forwards": getattr(msg, "forwards", None),
             "reply_to_msg_id": getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None),
@@ -219,7 +289,6 @@ async def build_payload_and_files(client: TelegramClient, msg: Message, channel_
     }
 
     files: List[Tuple[str, Tuple[str, bytes, str]]] = []
-
     if not cfg.INCLUDE_MEDIA:
         return payload, None
 
@@ -266,14 +335,12 @@ async def build_payload_and_files(client: TelegramClient, msg: Message, channel_
             except Exception:
                 pass
 
-    # Dọn text để đỡ gửi rác về Worker (giữ bố cục)
-    payload["message"]["text"] = _strip_urls_keep_lines(payload["message"]["text"])
     return payload, (files if files else None)
 
-# ============ Gửi về Worker ============
+# ============ Callback to Worker ============
 async def send_callback(payload: dict, files: Optional[List[Tuple[str, Tuple[str, bytes, str]]]]):
     if not cfg.CALLBACK_URL:
-        print("[!] CALLBACK_URL empty, skip")
+        await alert("⚠️ CALLBACK_URL is empty; skip sending /post-new")
         return
     headers = {}
     if cfg.CALLBACK_BEARER:
@@ -288,7 +355,7 @@ async def send_callback(payload: dict, files: Optional[List[Tuple[str, Tuple[str
         else:
             await s.post(cfg.CALLBACK_URL, json=payload, headers=headers, timeout=60)
 
-# ============ Poll loop (gom album theo grouped_id) ============
+# ============ Poll loop (grouped_id -> album) ============
 async def poll_loop():
     while True:
         try:
@@ -338,10 +405,9 @@ async def _poll_one_session(sw: SessionWrap, ch_names: List[str]):
                 else:
                     singles.append(m)
 
-            # Album groups -> 1 callback duy nhất
+            # Albums
             for gid, gid_msgs in groups.items():
                 gid_msgs.sort(key=lambda x: x.id or 0)
-                # pick message có text dài nhất làm primary caption
                 primary = max(gid_msgs, key=lambda x: len(x.message or ""), default=gid_msgs[0])
 
                 payload, files = await build_payload_and_files(client, primary, name)
@@ -355,7 +421,7 @@ async def _poll_one_session(sw: SessionWrap, ch_names: List[str]):
                     if f:
                         bin_files.extend(f)
 
-                # unique theo (file_name|mime)
+                # dedupe by (file_name|mime)
                 seen = set()
                 uniq = []
                 for mi in url_meta:
@@ -368,7 +434,7 @@ async def _poll_one_session(sw: SessionWrap, ch_names: List[str]):
                 await send_callback(payload, bin_files if bin_files else None)
                 set_last_id(name, gid_msgs[-1].id)
 
-            # Single posts
+            # Singles
             for m in singles:
                 payload, files = await build_payload_and_files(client, m, name)
                 await send_callback(payload, files)
@@ -377,14 +443,71 @@ async def _poll_one_session(sw: SessionWrap, ch_names: List[str]):
             await save_state()
 
         except FloodWaitError as e:
-            print(f"[FW] read {name}: wait {e.seconds}s")
+            await alert(f"⏳ FloodWait {int(e.seconds)}s when read @{name} (sess `#{sw.index}`)")
             await asyncio.sleep(e.seconds)
         except ChannelPrivateError:
             continue
-        except Exception:
+        except Exception as e:
+            # log nhẹ, tránh spam
             continue
 
+# ============ Monitor sessions ============
+@app.on_event("startup")
+async def on_startup():
+    await rescan_sessions()
+    asyncio.create_task(poll_loop())
+    asyncio.create_task(_monitor_sessions())
+
+async def _move_all_from_session(lost_idx: int):
+    victims = [name for name, meta in _state["channels"].items()
+               if meta.get("session_index") == lost_idx]
+    moved = 0
+    for ch_name in victims:
+        dst = _pick_least_loaded()
+        if dst:
+            await _reassign_channel(ch_name, dst)
+            moved += 1
+    if victims:
+        await alert(f"🔁 Moved {moved}/{len(victims)} channel(s) from dead sess `#{lost_idx}`")
+
+async def _monitor_sessions():
+    while True:
+        try:
+            await rescan_sessions()
+            # check authorizations
+            for sw in list(_sessions):
+                if not sw.client:
+                    continue
+                try:
+                    ok = await sw.client.is_user_authorized()
+                except Exception:
+                    ok = False
+                if not ok and sw.online:
+                    sw.online = False
+                    await alert(f"❌ Session deauth: `#{sw.index}` ({sw.path.name})")
+                    await _move_all_from_session(sw.index)
+        except Exception:
+            pass
+        await asyncio.sleep(cfg.SESS_RESCAN_SEC)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    async with _sessions_lock:
+        for sw in _sessions:
+            try:
+                await stop_session(sw)
+            except Exception:
+                pass
+
 # ============ API ============
+def last_id_of(name: str) -> int:
+    info = _state["channels"].get(name) or {}
+    return int(info.get("last_id") or 0)
+
+def set_last_id(name: str, mid: int):
+    if name in _state["channels"]:
+        _state["channels"][name]["last_id"] = int(mid)
+
 @app.get("/status")
 async def status(_: Any = Depends(require_bearer)):
     async with _sessions_lock:
@@ -406,11 +529,10 @@ async def root():
 @app.get("/channel")
 async def add_channel(
     chanel: str = Query(..., alias="chanel"),
-    source: str = Query("", alias="source"),   # optional, chỉ để log/hiển thị
     _: Any = Depends(require_bearer)
 ):
     name = chanel.lstrip("@")
-    sw = choose_session_for_new_channel()
+    sw = _pick_least_loaded()
     if not sw:
         raise HTTPException(503, "No online session available")
     try:
@@ -429,10 +551,13 @@ async def add_channel(
             "last_id": last
         }
         await save_state()
+        await alert(f"➕ Added @{name} → sess `#{sw.index}` (baseline last_id={last})")
         return {"ok": True, "channel": name, "session_index": sw.index, "last_id": last}
     except FloodWaitError as e:
+        await alert(f"⏳ FloodWait {int(e.seconds)}s when add @{name} (sess `#{sw.index}`)")
         raise HTTPException(429, f"FloodWait {int(e.seconds)}s")
     except Exception as e:
+        await alert(f"⚠️ add_channel error @{name}: {e}")
         raise HTTPException(500, f"join/add failed: {e}")
 
 @app.get("/delete")
@@ -447,46 +572,12 @@ async def delete_channel(chanel: str = Query(..., alias="chanel"), _: Any = Depe
         if sw and sw.client:
             ent = await sw.client.get_entity(name)
             await sw.client(LeaveChannelRequest(ent))
-    except Exception:
-        pass
+            await alert(f"➖ Left @{name} from sess `#{idx}`")
+    except Exception as e:
+        await alert(f"⚠️ Leave error @{name} on sess `#{idx}`: {e}")
     _state["channels"].pop(name, None)
     await save_state()
     return {"ok": True, "removed": True}
-
-# ============ Startup / Shutdown ============
-@app.on_event("startup")
-async def on_startup():
-    await rescan_sessions()
-    asyncio.create_task(poll_loop())
-    asyncio.create_task(_monitor_sessions())
-
-async def _monitor_sessions():
-    while True:
-        try:
-            await rescan_sessions()
-            # nếu session bị deauth, chỉ log & để add_channel lần sau tự cân lại
-            for sw in list(_sessions):
-                if not sw.client:
-                    continue
-                try:
-                    ok = await sw.client.is_user_authorized()
-                except Exception:
-                    ok = False
-                if not ok and sw.online:
-                    sw.online = False
-                    print(f"[!] Session offline/deauth: {sw.path.name}")
-        except Exception:
-            pass
-        await asyncio.sleep(cfg.SESS_RESCAN_SEC)
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    async with _sessions_lock:
-        for sw in _sessions:
-            try:
-                await stop_session(sw)
-            except Exception:
-                pass
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host=cfg.BIND_HOST, port=cfg.BIND_PORT, reload=False, log_level="info")
