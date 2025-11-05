@@ -1,10 +1,40 @@
+# --- Env & secrets ---
 .env
+.env.*
+!.env.example
+
+# --- App runtime state ---
 sessions/
+*.session
+*.session-journal
 state.db
+state.db-shm
+state.db-wal
+logs/
+*.log
 
+# --- Python artifacts ---
 __pycache__/
-*.pyc
-.venv/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
 
+# --- Virtualenv ---
+.venv/
+venv/
+env/
+
+# --- Editors/IDE ---
+.vscode/
+.idea/
+
+# --- OS cruft ---
 .DS_Store
 Thumbs.db
