@@ -495,41 +495,27 @@ async def _monitor_sessions():
         
 async def _session_health_loop():
     """
-    Mỗi 10 phút báo:
-    - tổng số session
-    - bao nhiêu alive (online)
-    - bao nhiêu dead (offline)
-    kèm danh sách chi tiết.
+    Mỗi 10 phút báo ngắn gọn:
+    Total  : total | live: alive | die: dead
+    session: so_kenh_dang_quan_ly
     """
     while True:
         try:
             async with _sessions_lock:
                 snapshot = list(_sessions)
+                channel_count = len(_state.get("channels", {}))
 
             total = len(snapshot)
-            alive = [sw for sw in snapshot if sw.online]
-            dead = [sw for sw in snapshot if not sw.online]
+            live = sum(1 for sw in snapshot if sw.online)
+            die = total - live
 
-            lines = [
-                "🧩 tg-pool session health (every 10 min)",
-                f"Total: {total} | Alive: {len(alive)} | Dead: {len(dead)}",
-            ]
-
-            if alive:
-                lines.append(
-                    "✅ Alive: "
-                    + ", ".join(f"`#{sw.index}` ({sw.path.name})" for sw in alive)
+            # Chỉ gửi khi có ít nhất 1 session hoặc 1 channel
+            if total > 0 or channel_count > 0:
+                text = (
+                    f"Total  : {total} | live: {live} | die: {die}\n"
+                    f"session: {channel_count}"
                 )
-
-            if dead:
-                lines.append(
-                    "❌ Dead: "
-                    + ", ".join(f"`#{sw.index}` ({sw.path.name})" for sw in dead)
-                )
-
-            # Chỉ gửi nếu có ít nhất 1 session (tránh spam khi chưa up file .session)
-            if total > 0:
-                await alert("\n".join(lines))
+                await alert(text)
 
         except Exception:
             # tránh kill loop nếu có lỗi lặt vặt
@@ -537,6 +523,7 @@ async def _session_health_loop():
 
         # ngủ 10 phút
         await asyncio.sleep(600)
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
