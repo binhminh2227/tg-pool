@@ -495,34 +495,46 @@ async def _monitor_sessions():
         
 async def _session_health_loop():
     """
-    Mỗi 10 phút báo ngắn gọn:
+    Mỗi 10 phút báo:
     Total  : total | live: alive | die: dead
-    session: so_kenh_dang_quan_ly
+    session 1: X kênh
+    session 2: Y kênh
+    ...
+    (index hiển thị từ 1 cho dễ nhìn)
     """
     while True:
         try:
             async with _sessions_lock:
                 snapshot = list(_sessions)
-                channel_count = len(_state.get("channels", {}))
+                channels_state = dict(_state.get("channels", {}))
 
             total = len(snapshot)
             live = sum(1 for sw in snapshot if sw.online)
             die = total - live
 
-            # Chỉ gửi khi có ít nhất 1 session hoặc 1 channel
-            if total > 0 or channel_count > 0:
-                text = (
-                    f"Total  : {total} | live: {live} | die: {die}\n"
-                    f"session: {channel_count}"
-                )
-                await alert(text)
+            # Đếm số kênh / session_index
+            chan_counts = {sw.index: 0 for sw in snapshot}
+            for meta in channels_state.values():
+                idx = meta.get("session_index")
+                if isinstance(idx, int) and idx in chan_counts:
+                    chan_counts[idx] += 1
+
+            if total > 0:
+                lines = [f"Total  : {total} | live: {live} | die: {die}"]
+                
+                # Mỗi session 1 dòng
+                for sw in snapshot:
+                    human_idx = sw.index + 1      # cho dễ đọc: session 1, 2, 3...
+                    c = chan_counts.get(sw.index, 0)
+                    lines.append(f"session {human_idx}: {c}")
+
+                await alert("\n".join(lines))
 
         except Exception:
-            # tránh kill loop nếu có lỗi lặt vặt
+            # tránh kill loop nếu lỗi vặt
             pass
 
-        # ngủ 10 phút
-        await asyncio.sleep(600)
+        await asyncio.sleep(600)  # 10 phút
 
 
 @app.on_event("shutdown")
