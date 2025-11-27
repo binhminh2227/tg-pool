@@ -130,7 +130,8 @@ async def start_session(sw: SessionWrap):
         await alert(f"❌ Session NOT authorized: `{sw.path.name}`")
         return
     sw.online = True
-    await alert(f"🟢 Session online: `#{sw.index}` ({sw.path.name})")
+    # Không gửi alert mỗi lần online nữa, 10 phút báo 1 lần qua health loop
+
 
 async def stop_session(sw: SessionWrap):
     try:
@@ -139,9 +140,9 @@ async def stop_session(sw: SessionWrap):
     except Exception:
         pass
     sw.client = None
-    if sw.online:
-        await alert(f"🔴 Session offline: `#{sw.index}` ({sw.path.name})")
+    # Không gửi alert mỗi lần offline nữa, 10 phút báo 1 lần qua health loop
     sw.online = False
+
 
 def _online_sessions():
     return [sw for sw in _sessions if sw.online]
@@ -457,6 +458,8 @@ async def on_startup():
     await rescan_sessions()
     asyncio.create_task(poll_loop())
     asyncio.create_task(_monitor_sessions())
+    asyncio.create_task(_session_health_loop())  # loop báo 10 phút 1 lần
+
 
 async def _move_all_from_session(lost_idx: int):
     victims = [name for name, meta in _state["channels"].items()
@@ -489,6 +492,51 @@ async def _monitor_sessions():
         except Exception:
             pass
         await asyncio.sleep(cfg.SESS_RESCAN_SEC)
+        
+async def _session_health_loop():
+    """
+    Mỗi 10 phút báo:
+    - tổng số session
+    - bao nhiêu alive (online)
+    - bao nhiêu dead (offline)
+    kèm danh sách chi tiết.
+    """
+    while True:
+        try:
+            async with _sessions_lock:
+                snapshot = list(_sessions)
+
+            total = len(snapshot)
+            alive = [sw for sw in snapshot if sw.online]
+            dead = [sw for sw in snapshot if not sw.online]
+
+            lines = [
+                "🧩 tg-pool session health (every 10 min)",
+                f"Total: {total} | Alive: {len(alive)} | Dead: {len(dead)}",
+            ]
+
+            if alive:
+                lines.append(
+                    "✅ Alive: "
+                    + ", ".join(f"`#{sw.index}` ({sw.path.name})" for sw in alive)
+                )
+
+            if dead:
+                lines.append(
+                    "❌ Dead: "
+                    + ", ".join(f"`#{sw.index}` ({sw.path.name})" for sw in dead)
+                )
+
+            # Chỉ gửi nếu có ít nhất 1 session (tránh spam khi chưa up file .session)
+            if total > 0:
+                await alert("\n".join(lines))
+
+        except Exception:
+            # tránh kill loop nếu có lỗi lặt vặt
+            pass
+
+        # ngủ 10 phút
+        await asyncio.sleep(600)
 
 @app.on_event("shutdown")
 async def on_shutdown():
